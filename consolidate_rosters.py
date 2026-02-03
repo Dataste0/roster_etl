@@ -154,32 +154,31 @@ class FileReport:
 # Logging
 # ----------
 
-def setup_logging(debug: bool) -> logging.Logger:
+def setup_logging(debug: bool, log_folder: Path) -> logging.Logger:
+    log_path = log_folder / "roster_etl.log"
+
     logger = logging.getLogger("roster_etl")
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.handlers.clear()
 
-    if logger.handlers:
-        return logger
-
-    os.makedirs("logs", exist_ok=True)
-    log_path = Path("logs") / "roster_etl.log"
-
-    fmt = logging.Formatter(
+    formatter = logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setLevel(logging.DEBUG if debug else logging.INFO)
-    fh.setFormatter(fmt)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(formatter)
 
     sh = logging.StreamHandler(sys.stdout)
     sh.setLevel(logging.DEBUG if debug else logging.INFO)
-    sh.setFormatter(fmt)
+    sh.setFormatter(formatter)
 
     logger.addHandler(fh)
     logger.addHandler(sh)
+
     return logger
+
 
 
 # -------------------------
@@ -1384,13 +1383,24 @@ def main() -> None:
     parser.add_argument("--folder", default="rosters_input", help="Input folder containing .xlsx/.xlsm rosters (default: rosters_input)")
     parser.add_argument("--include-xls", action="store_true", help="Include .xls files (best-effort: will warn/skip unless you add support)")
     parser.add_argument("--out-roster", default="_consolidated_roster.csv", help="Output consolidated roster CSV")
-    parser.add_argument("--out-report", default="_roster_extraction_report.csv", help="Output extraction report CSV")
+    parser.add_argument("--out-report", default="roster_extraction_report.csv", help="Extraction report file name (written inside log folder)")
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
     parser.add_argument("--out-folder", default="out_per_file", help="Output folder for per-workbook roster CSVs")
     parser.add_argument("--delete-input", action="store_true", help="Delete input Excel files after successful CSV extraction")
+    parser.add_argument("--log-folder", default="logs", help="Folder where logfile and extraction report will be written")
     args = parser.parse_args()
 
-    logger = setup_logging(args.debug)
+    log_folder = Path(args.log_folder)
+    log_folder.mkdir(parents=True, exist_ok=True)
+
+    logger = setup_logging(args.debug, log_folder)
+
+    logger.info(
+        'CONFIG | input_folder="%s" | output_folder="%s" | log_folder="%s"',
+        Path(args.folder).resolve(),
+        Path(args.out_folder).resolve(),
+        log_folder.resolve(),
+    )
 
     folder = Path(args.folder)
     if not folder.exists():
@@ -1462,7 +1472,7 @@ def main() -> None:
     if rep_df.empty:
         rep_df = pd.DataFrame(columns=[f.name for f in FileReport.__dataclass_fields__.values()])
     
-    report_path = Path(args.out_report)
+    report_path = log_folder / args.out_report
 
     write_header = not report_path.exists()
 
