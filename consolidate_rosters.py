@@ -1387,6 +1387,7 @@ def main() -> None:
     parser.add_argument("--out-report", default="_roster_extraction_report.csv", help="Output extraction report CSV")
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
     parser.add_argument("--out-folder", default="out_per_file", help="Output folder for per-workbook roster CSVs")
+    parser.add_argument("--delete-input", action="store_true", help="Delete input Excel files after successful CSV extraction")
     args = parser.parse_args()
 
     logger = setup_logging(args.debug)
@@ -1430,6 +1431,7 @@ def main() -> None:
         out_path = out_folder / f"{safe_stem}__roster.csv"
 
         # Ensure only canonical columns (no extras) and stable order
+        csv_written = False
         if df_out is None or df_out.empty:
             pd.DataFrame(columns=CANONICAL_FIELDS).to_csv(out_path, index=False, encoding="utf-8-sig")
             logger.warning(f"{fp.name}: no rows extracted -> wrote empty {out_path.resolve()}")
@@ -1442,7 +1444,15 @@ def main() -> None:
             df_out = df_out[CANONICAL_FIELDS].copy()
 
             df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
+            csv_written = True
             logger.info(f"{fp.name}: wrote per-file roster {out_path.resolve()} rows={len(df_out)}")
+        
+        if args.delete_input and csv_written:
+            try:
+                fp.unlink()
+                logger.info(f'{fp.name}: input file deleted after successful extraction')
+            except Exception as e:
+                logger.error(f'{fp.name}: failed to delete input file: {e}')
 
         # Collect report rows
         for r in reps:
@@ -1451,8 +1461,24 @@ def main() -> None:
     rep_df = pd.DataFrame(report_rows)
     if rep_df.empty:
         rep_df = pd.DataFrame(columns=[f.name for f in FileReport.__dataclass_fields__.values()])
-    rep_df.to_csv(args.out_report, index=False, encoding="utf-8-sig")
-    logger.info(f"Wrote extraction report: {Path(args.out_report).resolve()} rows={len(rep_df)}")
+    
+    report_path = Path(args.out_report)
+
+    write_header = not report_path.exists()
+
+    rep_df.to_csv(
+        report_path,
+        mode="a",
+        index=False,
+        header=write_header,
+        encoding="utf-8-sig",
+    )
+
+    logger.info(
+        'Appended %s row(s) to extraction report "%s"',
+        len(rep_df),
+        report_path.resolve(),
+    )
 
 
 if __name__ == "__main__":
