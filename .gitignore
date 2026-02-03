@@ -1,0 +1,9 @@
+.conda/
+.vscode/
+__pycache__/
+done/
+logs/
+out_per_file/
+rosters_input/
+*.csv
+*.log
