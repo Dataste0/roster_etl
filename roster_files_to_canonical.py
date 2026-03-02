@@ -23,8 +23,10 @@ Canonical fields (ONLY these):
 - email
 - srt_id
 - active_status
+- term_reason (if present)
 - contributor_project_id (a02... if present)
 - project_id     (a01... if present)
+- contact_id     (003... if present)
 - source_file
 - source_sheet
 
@@ -74,8 +76,10 @@ CANONICAL_FIELDS = [
     "email",
     "srt_id",
     "active_status",
+    "term_reason",
     "contributor_project_id",
     "project_id",
+    "contact_id",
     "source_file",
     "source_sheet",
 ]
@@ -118,6 +122,13 @@ STATUS_ACTIVE_WORDS = re.compile(r"\b(active|current|enabled|live)\b", re.I)
 STATUS_INACTIVE_WORDS = re.compile(r"\b(inactive|disabled)\b", re.I)
 STATUS_HOLD_WORDS = re.compile(r"\b(hold|on\s*hold|paused|pause|suspended|pending)\b", re.I)
 STATUS_REMOVED_WORDS = re.compile(r"\b(removed|termed|terminated|offboard|off-board|archived|deactivated)\b", re.I)
+
+# Known roster status cell values (used for value-based column detection)
+ROSTER_STATUS_VALUES_REGEX = re.compile(
+    r"\b(active|inactive|termed|terminated|removed|production|training|on.?hold|hold|paused|"
+    r"deactivated|offboard|off.?board|archived|current|enabled|live|suspended|disabled)\b",
+    re.I,
+)
 
 # Validation thresholds (soft)
 EMAIL_VALID_RATIO_MIN = 0.30
@@ -575,6 +586,11 @@ def looks_like_person_name(v: str) -> bool:
     return True
 
 
+def looks_like_roster_status(v: str) -> bool:
+    """Return True if the cell value looks like a valid roster status word."""
+    return bool(v) and ROSTER_STATUS_VALUES_REGEX.search(v.strip()) is not None
+
+
 def looks_like_a01(v: str) -> bool:
     # project id: starts with a01 (case-insensitive)
     return bool(v) and re.match(r"^a01[a-z0-9]+$", v.strip(), re.I) is not None
@@ -583,6 +599,11 @@ def looks_like_a01(v: str) -> bool:
 def looks_like_a02(v: str) -> bool:
     # contributor id: starts with a02 (case-insensitive)
     return bool(v) and re.match(r"^a02[a-z0-9]+$", v.strip(), re.I) is not None
+
+
+def looks_like_003(v: str) -> bool:
+    # Salesforce Contact ID: starts with "003" followed by alphanumeric chars, total ~18 chars
+    return bool(v) and re.match(r"^003[a-z0-9]+$", v.strip(), re.I) is not None
 
 
 def profile_columns(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
@@ -602,6 +623,8 @@ def profile_columns(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
                 srt_like=0.0,
                 a01_like=0.0,
                 a02_like=0.0,
+                c003_like=0.0,
+                roster_status_like=0.0,
                 mostly_constant=True,
                 numeric_ratio=0.0,
                 unique_ratio=0.0,
@@ -614,6 +637,8 @@ def profile_columns(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
         srt_hits = sum(1 for v in non_empty if extract_srt_id_from_cell(v) is not None)
         a01_hits = sum(1 for v in non_empty if looks_like_a01(v))
         a02_hits = sum(1 for v in non_empty if looks_like_a02(v))
+        c003_hits = sum(1 for v in non_empty if looks_like_003(v))
+        roster_status_hits = sum(1 for v in non_empty if looks_like_roster_status(v))
 
         numeric_hits = sum(1 for v in non_empty if re.fullmatch(r"[0-9]+(\.[0-9]+)?", v) is not None)
 
@@ -632,6 +657,8 @@ def profile_columns(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
             srt_like=srt_hits / max(1, len(non_empty)),
             a01_like=a01_hits / max(1, len(non_empty)),
             a02_like=a02_hits / max(1, len(non_empty)),
+            c003_like=c003_hits / max(1, len(non_empty)),
+            roster_status_like=roster_status_hits / max(1, len(non_empty)),
             mostly_constant=bool(mostly_constant),
             numeric_ratio=numeric_hits / max(1, len(non_empty)),
             unique_ratio=float(unique_ratio),
@@ -674,8 +701,10 @@ def golden_map_columns(
         "last_name": None,
         "srt_id": None,
         "active_status": None,
+        "term_reason": None,
         "contributor_project_id": None,
         "project_id": None,
+        "contact_id": None,
     }
     candidates: Dict[str, List[str]] = {k: [] for k in mapping.keys()}
 
@@ -694,12 +723,36 @@ def golden_map_columns(
 
 
 
-    # Status/state
-    rx_status = re.compile(r"\b(status|state|activity|active\s*status|worker\s*status|contributor\s*status)\b", re.I)
+    # Status column detection — two tiers:
+    # Primary: names that almost certainly refer to roster/contributor status
+    rx_status_primary = re.compile(
+        r"\b(roster\s*status|contributor\s*(project\s*)?status|mercury\s*(contributor\s*)?status|"
+        r"project\s*status|worker\s*status|active\s*status|participant\s*status|"
+        r"employment\s*status|engagement\s*status)\b",
+        re.I,
+    )
+    # Fallback: generic "status"/"state" columns — admitted only when their values
+    # actually look like roster status words (scored later in pick_best)
+    rx_status_fallback = re.compile(r"\b(status|state)\b", re.I)
+    # Penalty pattern: column names that are clearly NOT roster status
+    rx_status_bad = re.compile(
+        r"\b(pass|fail|vpn|completion|tracking|learning|path|certification|quiz|test|exam|"
+        r"access|background|check|language|skill|quality|score|result|grade|performance)\b",
+        re.I,
+    )
+
+    # Term/removal reason
+    rx_term_reason = re.compile(
+        r"(term|terminat|offboard|off.?board|remov|deactivat|exit|separat)\w*\s*reason"
+        r"|reason\s*(for\s*)?(term|terminat|offboard|remov|deactivat|exit|separat)\w*"
+        r"|\bterm\s*reason\b",
+        re.I,
+    )
 
     # IDs: accept explicit column names, but also rely on value-based detection via profiles
     rx_project_id = re.compile(r"\b(project\s*id|projectid)\b", re.I)
     rx_contributor_project_id = re.compile(r"\b(contributor\s*id|worker\s*id|agent\s*id|user\s*id|uid|cid)\b", re.I)
+    rx_contact_id = re.compile(r"\b(contact\s*id|contactid|sfdc\s*id|salesforce\s*id)\b", re.I)
 
     for col, ncol in cols_norm.items():
         if rx_email.search(ncol):
@@ -717,7 +770,9 @@ def golden_map_columns(
         if rx_srt.search(ncol):
             candidates["srt_id"].append(col)
 
-        if rx_status.search(ncol):
+        if rx_status_primary.search(ncol):
+            candidates["active_status"].append(col)
+        elif rx_status_fallback.search(ncol) and not rx_status_bad.search(ncol):
             candidates["active_status"].append(col)
 
         if rx_project_id.search(ncol):
@@ -725,6 +780,12 @@ def golden_map_columns(
 
         if rx_contributor_project_id.search(ncol):
             candidates["contributor_project_id"].append(col)
+
+        if rx_contact_id.search(ncol):
+            candidates["contact_id"].append(col)
+
+        if rx_term_reason.search(ncol):
+            candidates["term_reason"].append(col)
 
     # Value-based candidates for a01/a02 even if headers are weird
     for col in columns:
@@ -735,6 +796,12 @@ def golden_map_columns(
         if float(p.get("a02_like", 0.0)) >= 0.20:
             if col not in candidates["contributor_project_id"]:
                 candidates["contributor_project_id"].append(col)
+        if float(p.get("c003_like", 0.0)) >= 0.20:
+            if col not in candidates["contact_id"]:
+                candidates["contact_id"].append(col)
+        if float(p.get("roster_status_like", 0.0)) >= 0.50:
+            if col not in candidates["active_status"]:
+                candidates["active_status"].append(col)
     
     # Value-based candidates for SRT even if header matching fails (robust fallback)
     for col in columns:
@@ -774,22 +841,53 @@ def golden_map_columns(
                 score += (0.0 if p.get("mostly_constant", False) else 0.8)
 
             elif field == "active_status":
-                # Status is usually short text with moderate variety
-                score += (0.0 if float(p.get("numeric_ratio", 0.0)) > 0.2 else 1.0)
-                score += (0.0 if p.get("mostly_constant", False) else 1.2)
-                score += min(1.2, float(p.get("unique_ratio", 0.0)) * 1.5)
-                if "status" in _norm_col(c) or "state" in _norm_col(c):
-                    score += 0.6
+                n = _norm_col(c)
+                # Primary signal: how many cell values look like real roster status words
+                score += float(p.get("roster_status_like", 0.0)) * 12.0
+                # Header bonus — tiered by specificity
+                if re.search(
+                    r"\b(roster\s*status|contributor\s*(project\s*)?status|"
+                    r"mercury\s*(contributor\s*)?status)\b", n, re.I
+                ):
+                    score += 6.0
+                elif re.search(
+                    r"\b(project\s*status|worker\s*status|active\s*status|"
+                    r"participant\s*status|employment\s*status|engagement\s*status)\b", n, re.I
+                ):
+                    score += 3.0
+                elif "status" in n or "state" in n:
+                    score += 0.5
+                # Hard penalty for columns that are clearly NOT roster status
+                if re.search(
+                    r"\b(pass|fail|vpn|completion|tracking|learning|path|certification|"
+                    r"quiz|test|exam|access|background|check|language|skill|quality|"
+                    r"score|result|grade|performance)\b", n, re.I
+                ):
+                    score -= 8.0
+                # Mild secondary signals
+                score += (0.0 if float(p.get("numeric_ratio", 0.0)) > 0.2 else 0.5)
+                score += (0.0 if p.get("mostly_constant", False) else 0.3)
 
             elif field == "project_id":
                 score += float(p.get("a01_like", 0.0)) * 10.0
                 if "project id" in _norm_col(c) or "projectid" in _norm_col(c):
                     score += 0.7
 
+            elif field == "term_reason":
+                score += (0.0 if p.get("mostly_constant", False) else 0.8)
+                score += min(1.0, float(p.get("unique_ratio", 0.0)) * 1.5)
+                if "reason" in _norm_col(c):
+                    score += 0.6
+
             elif field == "contributor_project_id":
                 score += float(p.get("a02_like", 0.0)) * 10.0
                 if "contributor id" in _norm_col(c) or "worker id" in _norm_col(c):
                     score += 0.5
+
+            elif field == "contact_id":
+                score += float(p.get("c003_like", 0.0)) * 10.0
+                if "contact id" in _norm_col(c) or "contactid" in _norm_col(c):
+                    score += 0.7
 
             scored.append((c, score))
 
@@ -1053,6 +1151,16 @@ def _extract_first_a02(v: Any) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _extract_first_003(v: Any) -> Optional[str]:
+    if pd.isna(v):
+        return None
+    t = str(v).strip()
+    if not t:
+        return None
+    m = re.search(r"\b(003[a-z0-9]+)\b", t, re.I)
+    return m.group(1) if m else None
+
+
 def extract_roster(
     df: pd.DataFrame,
     mapping: Dict[str, Optional[str]],
@@ -1118,6 +1226,14 @@ def extract_roster(
     else:
         out["project_id"] = pd.NA
 
+    # Contact ID (003...)
+    ctid_col = mapping.get("contact_id")
+    if ctid_col and ctid_col in df.columns:
+        out["contact_id"] = df[ctid_col].apply(_extract_first_003).astype("string")
+        out["contact_id"] = out["contact_id"].replace({"<NA>": pd.NA})
+    else:
+        out["contact_id"] = pd.NA
+
     # Active status
     status_col = mapping.get("active_status")
     default_status = sheet_default_status(source_sheet)
@@ -1126,6 +1242,13 @@ def extract_roster(
         out["active_status"] = out["active_status"].fillna(default_status)
     else:
         out["active_status"] = default_status
+
+    # Term reason
+    term_reason_col = mapping.get("term_reason")
+    if term_reason_col and term_reason_col in df.columns:
+        out["term_reason"] = _safe_series_to_str(df[term_reason_col]).replace("", None)
+    else:
+        out["term_reason"] = pd.NA
 
     # Sources
     out["source_file"] = source_file
@@ -1149,6 +1272,7 @@ def extract_roster(
         "srt_nonnull": int(out["srt_id"].notna().sum()),
         "a02_nonnull": int(out["contributor_project_id"].notna().sum()),
         "a01_nonnull": int(out["project_id"].notna().sum()),
+        "c003_nonnull": int(out["contact_id"].notna().sum()),
     }
 
     if stats["rows_out"] == 0:
@@ -1248,8 +1372,10 @@ def process_file(
         "last_name": None,
         "srt_id": None,
         "active_status": None,
+        "term_reason": None,
         "contributor_project_id": None,
         "project_id": None,
+        "contact_id": None,
     }
 
     extracted_total = 0
@@ -1293,7 +1419,8 @@ def process_file(
             logger.info(
                 'FILE_MAPPING | file="%s" | sheet="%s" | '
                 'email="%s" | full_name="%s" | first_name="%s" | last_name="%s" | '
-                'srt_id="%s" | active_status="%s" | contributor_project_id="%s" | project_id="%s"',
+                'srt_id="%s" | active_status="%s" | term_reason="%s" | '
+                'contributor_project_id="%s" | project_id="%s" | contact_id="%s"',
                 file_path.name,
                 sh,
                 mapping.get("email"),
@@ -1302,8 +1429,10 @@ def process_file(
                 mapping.get("last_name"),
                 mapping.get("srt_id"),
                 mapping.get("active_status"),
+                mapping.get("term_reason"),
                 mapping.get("contributor_project_id"),
                 mapping.get("project_id"),
+                mapping.get("contact_id"),
             )
 
             logger.debug(f"{file_path.name} | {sh}: columns={list(df.columns)}")
