@@ -57,6 +57,8 @@ import logging
 import os
 import re
 import sys
+import shutil
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -734,6 +736,8 @@ def golden_map_columns(
     # Fallback: generic "status"/"state" columns — admitted only when their values
     # actually look like roster status words (scored later in pick_best)
     rx_status_fallback = re.compile(r"\b(status|state)\b", re.I)
+    # Explicitly exclude certain misleading headers that are not roster status
+    rx_status_exclude = re.compile(r"\b(srt\s*account\s*status|srt account status|ac\s*status)\b", re.I)
     # Penalty pattern: column names that are clearly NOT roster status
     rx_status_bad = re.compile(
         r"\b(pass|fail|vpn|completion|tracking|learning|path|certification|quiz|test|exam|"
@@ -770,7 +774,11 @@ def golden_map_columns(
         if rx_srt.search(ncol):
             candidates["srt_id"].append(col)
 
-        if rx_status_primary.search(ncol):
+        # Skip columns that match explicit exclusion patterns (these aren't roster status)
+        if rx_status_exclude.search(ncol):
+            # do not add to active_status candidates
+            pass
+        elif rx_status_primary.search(ncol):
             candidates["active_status"].append(col)
         elif rx_status_fallback.search(ncol) and not rx_status_bad.search(ncol):
             candidates["active_status"].append(col)
@@ -1253,7 +1261,6 @@ def extract_roster(
     # Sources
     out["source_file"] = source_file
     out["source_sheet"] = source_sheet
-
     # Remove obvious header repeats in data
     out["email"] = out["email"].apply(lambda v: pd.NA if isinstance(v, str) and v.strip().lower() in ("email", "e-mail") else v)
     out["full_name"] = out["full_name"].apply(lambda v: pd.NA if isinstance(v, str) and v.strip().lower() in ("name", "full name") else v)
@@ -1507,6 +1514,33 @@ def find_input_files(folder: Path, include_xls: bool) -> List[Path]:
     return files
 
 
+def _move_with_retries(src: Path, dest: Path, logger: logging.Logger, max_attempts: int = 5) -> bool:
+    """Attempt to move `src` to `dest` with retries on Windows file-lock errors.
+
+    Returns True if moved, False otherwise.
+    """
+    attempt = 0
+    delay = 0.25
+    while attempt < max_attempts:
+        try:
+            shutil.move(str(src), str(dest))
+            return True
+        except (PermissionError, OSError) as e:
+            # WinError 32 -> file locked by another process
+            err_no = getattr(e, "winerror", None)
+            if err_no == 32 or isinstance(e, PermissionError):
+                attempt += 1
+                logger.debug(f"{src.name}: move attempt {attempt}/{max_attempts} failed (locked). Retrying in {delay}s")
+                time.sleep(delay)
+                delay = min(5.0, delay * 2)
+                continue
+            else:
+                logger.debug(f"{src.name}: move failed with error: {e}")
+                return False
+    logger.error(f"{src.name}: failed to move after {max_attempts} attempts (file may be locked by another process)")
+    return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deterministic consolidation of contributor rosters from Excel files.")
     parser.add_argument("--folder", default="rosters_input", help="Input folder containing .xlsx/.xlsm rosters (default: rosters_input)")
@@ -1540,6 +1574,41 @@ def main() -> None:
     out_folder.mkdir(parents=True, exist_ok=True)
 
     files = find_input_files(folder, args.include_xls)
+    # Move input files that already have a per-file CSV in the output folder to `done/`.
+    # This avoids re-processing files that were already successfully extracted earlier.
+    remaining: List[Path] = []
+    done_folder = (folder.parent / "done").resolve()
+    done_folder.mkdir(parents=True, exist_ok=True)
+    for fp in files:
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", fp.stem).strip("_")
+        existing_out = out_folder / f"{safe_stem}__roster.csv"
+        if existing_out.exists():
+            try:
+                if args.delete_input:
+                    fp.unlink()
+                    logger.info(f'{fp.name}: input file deleted (already processed)')
+                else:
+                    dest = done_folder / fp.name
+                    if dest.exists():
+                        base = fp.stem
+                        suf = fp.suffix
+                        i = 1
+                        while True:
+                            candidate = done_folder / f"{base}_{i}{suf}"
+                            if not candidate.exists():
+                                dest = candidate
+                                break
+                            i += 1
+                    moved = _move_with_retries(fp, dest, logger)
+                    if moved:
+                        logger.info(f'{fp.name}: already processed -> moved to {dest.resolve()}')
+                    else:
+                        logger.error(f'{fp.name}: failed to move already-processed file to done/')
+            except Exception as e:
+                logger.error(f'{fp.name}: failed to move already-processed file to done/: {e}')
+        else:
+            remaining.append(fp)
+    files = remaining
     if not files:
         logger.warning(f"No input files found in {folder.resolve()} (expected .xlsx/.xlsm)")
         pd.DataFrame(columns=CANONICAL_FIELDS).to_csv(args.out_roster, index=False, encoding="utf-8-sig")
@@ -1586,12 +1655,35 @@ def main() -> None:
             csv_written = True
             logger.info(f"{fp.name}: wrote per-file roster {out_path.resolve()} rows={len(df_out)}")
         
-        if args.delete_input and csv_written:
-            try:
-                fp.unlink()
-                logger.info(f'{fp.name}: input file deleted after successful extraction')
-            except Exception as e:
-                logger.error(f'{fp.name}: failed to delete input file: {e}')
+        if csv_written:
+            # Prefer moving processed files to the repository 'done' folder by default.
+            # If the user explicitly requests deletion via --delete-input, delete instead.
+            if args.delete_input:
+                try:
+                    fp.unlink()
+                    logger.info(f'{fp.name}: input file deleted after successful extraction')
+                except Exception as e:
+                    logger.error(f'{fp.name}: failed to delete input file: {e}')
+            else:
+                try:
+                    done_folder = (folder.parent / "done").resolve()
+                    done_folder.mkdir(parents=True, exist_ok=True)
+                    dest = done_folder / fp.name
+                    # avoid overwrite by adding a numeric suffix if needed
+                    if dest.exists():
+                        base = fp.stem
+                        suf = fp.suffix
+                        i = 1
+                        while True:
+                            candidate = done_folder / f"{base}_{i}{suf}"
+                            if not candidate.exists():
+                                dest = candidate
+                                break
+                            i += 1
+                    shutil.move(str(fp), str(dest))
+                    logger.info(f'{fp.name}: moved to {dest.resolve()} after successful extraction')
+                except Exception as e:
+                    logger.error(f'{fp.name}: failed to move input file to done/: {e}')
 
         # Collect report rows
         for r in reps:
